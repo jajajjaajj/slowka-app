@@ -24,10 +24,11 @@
     .full { width: 100%; }
     .hint { font-size: 14px; color:#666; margin-top: 6px; }
     .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f3f3f3; padding:2px 6px; border-radius:8px; }
+    .pill { display:inline-block; padding:3px 10px; border-radius:999px; border:1px solid #ddd; font-size: 13px; color:#444; }
   </style>
 </head>
 <body>
-  <h1>📚 Słówka EN/PL (offline w przeglądarce)</h1>
+  <h1>📚 Słówka EN/PL (tryb powtórek aż do skutku)</h1>
 
   <div class="card">
     <div class="row">
@@ -36,7 +37,8 @@
       <button id="clear">Wyczyść listę</button>
     </div>
     <div class="hint">
-      Plik: <span class="kbd">angielski,polski</span> (CSV) albo <span class="kbd">angielski\tpolski</span> (TSV). Jedno słówko na linię.
+      Format: <span class="kbd">angielski,polski</span> (CSV) albo <span class="kbd">angielski;polski</span> lub <span class="kbd">angielski\tpolski</span>.
+      Jedna para na linię.
     </div>
     <div class="spacer"></div>
     <div class="row">
@@ -58,7 +60,11 @@
   </div>
 
   <div class="card" id="quizCard" style="display:none;">
-    <div class="muted" id="progress"></div>
+    <div class="row" style="justify-content: space-between;">
+      <div class="muted" id="progress"></div>
+      <div class="pill" id="roundInfo" title="Po zakończeniu rundy wracają tylko błędne słówka">Runda: 1</div>
+    </div>
+
     <div class="spacer"></div>
     <div class="big" id="prompt"></div>
     <div class="spacer"></div>
@@ -68,6 +74,7 @@
 
     <div class="row">
       <button id="check">Sprawdź</button>
+      <button id="dontKnow">Nie wiem</button>
       <button id="show">Pokaż odpowiedź</button>
       <button id="next">Następne</button>
     </div>
@@ -88,21 +95,24 @@
     stats: document.getElementById('stats'),
     quizCard: document.getElementById('quizCard'),
     progress: document.getElementById('progress'),
+    roundInfo: document.getElementById('roundInfo'),
     prompt: document.getElementById('prompt'),
     answer: document.getElementById('answer'),
     check: document.getElementById('check'),
+    dontKnow: document.getElementById('dontKnow'),
     show: document.getElementById('show'),
     next: document.getElementById('next'),
     feedback: document.getElementById('feedback'),
   };
 
-  let pairs = [];      // {en, pl}
-  let order = [];      // indices
-  let idx = 0;
-  let correct = 0;
-  let tried = 0;
+  let pairs = [];              // {en, pl}
+  let order = [];              // indices in current round
+  let idx = 0;                 // position in current round
+  let round = 1;               // round number
+  let wrongSet = new Set();    // indices answered wrong in current round
+  let checkedThisCard = false; // whether this question was already evaluated (so wrong not double-counted)
 
-  const STORAGE_KEY = "slownika_pairs_v1";
+  const STORAGE_KEY = "slownika_pairs_v2";
 
   function normalize(s) {
     return (s ?? "")
@@ -115,22 +125,32 @@
   function parseLines(text) {
     const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
     const out = [];
-    for (const line of lines) {
-      // allow comma, semicolon, tab, or " - " as separator
+
+    for (const lineRaw of lines) {
+      const line = lineRaw.replace(/\uFEFF/g, "").trim(); // remove BOM if present
       let parts;
+
       if (line.includes("\t")) parts = line.split("\t");
       else if (line.includes(";")) parts = line.split(";");
       else if (line.includes(",")) parts = line.split(",");
       else if (line.includes(" - ")) parts = line.split(" - ");
+      else if (line.includes(" = ")) parts = line.split(" = ");
+      else if (line.includes("=")) parts = line.split("=");
+      else if (line.includes("–")) parts = line.split("–");
+      else if (line.includes("—")) parts = line.split("—");
+      else if (line.includes("-")) parts = line.split("-");
       else continue;
 
+      if (!parts || parts.length < 2) continue;
+
       const left = (parts[0] ?? "").trim();
-      const right = (parts.slice(1).join(parts.includes(",") ? "," : parts.includes(";") ? ";" : " ").trim()); // keep commas in meaning
+      const right = (parts.slice(1).join(parts[1]?.includes(",") ? "," : " ").trim());
       if (!left || !right) continue;
 
-      // assume left=en right=pl (as you described)
+      // assume left=en right=pl
       out.push({ en: left, pl: right });
     }
+
     return out;
   }
 
@@ -149,25 +169,37 @@
 
   function updateStats() {
     els.stats.textContent = pairs.length
-      ? `Wczytane słówka: ${pairs.length}.`
+      ? `Wczytane słówka: ${pairs.length}. (Błędne wracają w kolejnych rundach aż je opanujesz.)`
       : "Brak wczytanych słówek.";
   }
 
-  function makeOrder() {
-    order = pairs.map((_, i) => i);
-    if (els.shuffle.value === "yes") {
-      for (let i = order.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [order[i], order[j]] = [order[j], order[i]];
-      }
+  function shuffleArray(a) {
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
     }
+  }
+
+  function makeOrderFromAll() {
+    order = pairs.map((_, i) => i);
+    if (els.shuffle.value === "yes") shuffleArray(order);
+  }
+
+  function makeOrderFromWrong() {
+    order = Array.from(wrongSet);
+    if (els.shuffle.value === "yes") shuffleArray(order);
   }
 
   function currentQA() {
     const p = pairs[order[idx]];
     const mode = els.mode.value;
-    if (mode === "pl-en") return { prompt: p.pl, expected: p.en, other: p.pl };
-    return { prompt: p.en, expected: p.pl, other: p.en };
+    if (mode === "pl-en") return { prompt: p.pl, expected: p.en };
+    return { prompt: p.en, expected: p.pl };
+  }
+
+  function updateHeader() {
+    els.roundInfo.textContent = `Runda: ${round}`;
+    els.progress.textContent = `Pytanie ${idx + 1} / ${order.length} • Do powtórki w tej rundzie: ${wrongSet.size}`;
   }
 
   function render() {
@@ -176,66 +208,122 @@
       updateStats();
       return;
     }
+    if (!order.length) {
+      // nothing to show (shouldn't happen unless list empty)
+      els.quizCard.style.display = "none";
+      return;
+    }
+
     els.quizCard.style.display = "block";
     const { prompt } = currentQA();
     els.prompt.textContent = prompt;
     els.answer.value = "";
     els.answer.focus();
     els.feedback.textContent = "";
-    els.progress.textContent = `Pytanie ${idx + 1} / ${order.length} • Wynik: ${correct}/${tried}`;
+    checkedThisCard = false;
+    updateHeader();
   }
 
   function resetQuiz() {
     if (!pairs.length) return;
-    idx = 0; correct = 0; tried = 0;
-    makeOrder();
+    round = 1;
+    wrongSet = new Set();
+    idx = 0;
+    makeOrderFromAll();
     render();
   }
 
-  function checkAnswer(showAnswer=false) {
+  function markWrongOnce() {
+    if (checkedThisCard) return;
+    wrongSet.add(order[idx]);
+    checkedThisCard = true;
+    updateHeader();
+  }
+
+  function markChecked() {
+    if (checkedThisCard) return;
+    checkedThisCard = true;
+    updateHeader();
+  }
+
+  function checkAnswer() {
     if (!pairs.length) return;
     const { expected } = currentQA();
     const user = normalize(els.answer.value);
     const exp = normalize(expected);
 
-    if (!showAnswer) tried++;
-
-    if (showAnswer) {
-      els.feedback.innerHTML = `Odpowiedź: <b>${expected}</b>`;
-      return;
-    }
-
     if (!user) {
-      els.feedback.innerHTML = `<span class="bad">Wpisz odpowiedź 🙂</span>`;
-      tried--; // don't count empty
+      els.feedback.innerHTML = `<span class="bad">Wpisz odpowiedź</span> albo kliknij <b>Nie wiem</b>.`;
       return;
     }
 
     if (user === exp) {
-      correct++;
       els.feedback.innerHTML = `<span class="ok">Dobrze!</span> ✅`;
+      markChecked();
     } else {
       els.feedback.innerHTML = `<span class="bad">Źle.</span> Poprawnie: <b>${expected}</b>`;
+      markWrongOnce();
     }
-    els.progress.textContent = `Pytanie ${idx + 1} / ${order.length} • Wynik: ${correct}/${tried}`;
   }
 
-  function next() {
+  function dontKnow() {
     if (!pairs.length) return;
+    const { expected } = currentQA();
+    els.feedback.innerHTML = `<span class="bad">OK, wróci później.</span> Poprawnie: <b>${expected}</b>`;
+    markWrongOnce();
+  }
+
+  function showAnswer() {
+    if (!pairs.length) return;
+    const { expected } = currentQA();
+    els.feedback.innerHTML = `Odpowiedź: <b>${expected}</b>`;
+    // Samo "pokaż" nie liczy jako błąd, ale też nie zalicza jako dobrze.
+    // Jeśli chcesz, żeby samo "Pokaż" też wrzucało do powtórek, odkomentuj linię:
+    // markWrongOnce();
+  }
+
+  function finishRoundOrNext() {
+    if (!pairs.length) return;
+
     idx++;
-    if (idx >= order.length) {
-      els.feedback.innerHTML = `<b>Koniec!</b> Wynik: ${correct}/${tried}. Kliknij <b>Start / Reset</b>, żeby zacząć od nowa.`;
-      idx = order.length - 1;
+
+    if (idx < order.length) {
+      render();
       return;
     }
-    render();
+
+    // End of this round
+    if (wrongSet.size === 0) {
+      els.feedback.innerHTML = `<b>🎉 Brawo!</b> Wszystko opanowane w tej sesji. Kliknij <b>Start / Reset</b>, żeby zacząć od nowa.`;
+      // keep last card visible
+      idx = order.length - 1;
+      updateHeader();
+      return;
+    }
+
+    // Start next round with wrong-only
+    round++;
+    idx = 0;
+    makeOrderFromWrong();
+
+    // reset wrongSet for new round (we will refill it with still-wrong)
+    wrongSet = new Set();
+
+    els.feedback.innerHTML = `<b>Runda ${round}</b>: teraz tylko te słówka, które były błędne.`;
+    // short delay so user sees message, then render next
+    setTimeout(render, 250);
   }
 
   // Events
   els.file.addEventListener("change", async (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
-    const text = await f.text();
+
+    // Force UTF-8 decoding (fix PL characters)
+    const buffer = await f.arrayBuffer();
+    const decoder = new TextDecoder("utf-8");
+    const text = decoder.decode(buffer);
+
     const parsed = parseLines(text);
     if (!parsed.length) {
       alert("Nie udało się wczytać. Sprawdź format: angielski,polski (jedna para na linię).");
@@ -267,12 +355,15 @@ environment,środowisko`;
   });
 
   els.start.addEventListener("click", resetQuiz);
-  els.check.addEventListener("click", () => checkAnswer(false));
-  els.show.addEventListener("click", () => checkAnswer(true));
-  els.next.addEventListener("click", next);
+  els.check.addEventListener("click", checkAnswer);
+  els.dontKnow.addEventListener("click", dontKnow);
+  els.show.addEventListener("click", showAnswer);
+  els.next.addEventListener("click", finishRoundOrNext);
 
   els.answer.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") checkAnswer(false);
+    if (e.key === "Enter") {
+      checkAnswer();
+    }
   });
 
   // Load persisted list
