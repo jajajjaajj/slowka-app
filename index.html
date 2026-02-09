@@ -5,16 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Słówka EN/PL</title>
 
-  <!-- PWA basics -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
 
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 16px; max-width: 720px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 16px; max-width: 760px; }
     h1 { font-size: 20px; margin: 8px 0 16px; }
     .card { border: 1px solid #ddd; border-radius: 14px; padding: 14px; margin: 12px 0; }
     .row { display:flex; gap:10px; flex-wrap: wrap; align-items: center; }
-    button, select, input[type="text"] { font-size: 16px; padding: 10px 12px; border-radius: 12px; border: 1px solid #ccc; }
+    button, select, input[type="text"], input[type="number"] { font-size: 16px; padding: 10px 12px; border-radius: 12px; border: 1px solid #ccc; }
     button { cursor:pointer; }
     .big { font-size: 22px; font-weight: 700; }
     .muted { color:#666; }
@@ -28,7 +27,7 @@
   </style>
 </head>
 <body>
-  <h1>📚 Słówka EN/PL (tryb powtórek aż do skutku)</h1>
+  <h1>📚 Słówka EN/PL (grupy po 15 + powtórki do skutku)</h1>
 
   <div class="card">
     <div class="row">
@@ -36,11 +35,13 @@
       <button id="loadSample">Wczytaj przykładową listę</button>
       <button id="clear">Wyczyść listę</button>
     </div>
+
     <div class="hint">
-      Format: <span class="kbd">angielski,polski</span> (CSV) albo <span class="kbd">angielski;polski</span> lub <span class="kbd">angielski\tpolski</span>.
-      Jedna para na linię.
+      Format: <span class="kbd">EN,PL</span> albo <span class="kbd">EN;PL</span> / <span class="kbd">EN\tPL</span>. Jedna para na linię.
     </div>
+
     <div class="spacer"></div>
+
     <div class="row">
       <label>Tryb:
         <select id="mode">
@@ -48,21 +49,28 @@
           <option value="en-pl">EN → PL</option>
         </select>
       </label>
-      <label>Losowo:
+
+      <label>Losowo w grupie:
         <select id="shuffle">
           <option value="yes">Tak</option>
           <option value="no">Nie</option>
         </select>
       </label>
+
+      <label>Wielkość grupy:
+        <input id="groupSize" type="number" min="5" max="100" value="15" style="width:90px;">
+      </label>
+
       <button id="start">Start / Reset</button>
     </div>
+
     <div class="muted" id="stats">Brak wczytanych słówek.</div>
   </div>
 
   <div class="card" id="quizCard" style="display:none;">
     <div class="row" style="justify-content: space-between;">
       <div class="muted" id="progress"></div>
-      <div class="pill" id="roundInfo" title="Po zakończeniu rundy wracają tylko błędne słówka">Runda: 1</div>
+      <div class="pill" id="groupInfo">Grupa 1</div>
     </div>
 
     <div class="spacer"></div>
@@ -75,7 +83,7 @@
     <div class="row">
       <button id="check">Sprawdź</button>
       <button id="dontKnow">Nie wiem</button>
-      <button id="show">Pokaż odpowiedź</button>
+      <button id="show">Pokaż</button>
       <button id="next">Następne</button>
     </div>
 
@@ -91,11 +99,12 @@
     clear: document.getElementById('clear'),
     mode: document.getElementById('mode'),
     shuffle: document.getElementById('shuffle'),
+    groupSize: document.getElementById('groupSize'),
     start: document.getElementById('start'),
     stats: document.getElementById('stats'),
     quizCard: document.getElementById('quizCard'),
     progress: document.getElementById('progress'),
-    roundInfo: document.getElementById('roundInfo'),
+    groupInfo: document.getElementById('groupInfo'),
     prompt: document.getElementById('prompt'),
     answer: document.getElementById('answer'),
     check: document.getElementById('check'),
@@ -105,27 +114,27 @@
     feedback: document.getElementById('feedback'),
   };
 
-  let pairs = [];              // {en, pl}
-  let order = [];              // indices in current round
-  let idx = 0;                 // position in current round
-  let round = 1;               // round number
-  let wrongSet = new Set();    // indices answered wrong in current round
-  let checkedThisCard = false; // whether this question was already evaluated (so wrong not double-counted)
+  // ===== Data =====
+  let pairs = []; // {en,pl}
+  const STORAGE_KEY = "slownika_pairs_groups_v1";
 
-  const STORAGE_KEY = "slownika_pairs_v2";
+  // ===== Group state =====
+  let groupSize = 15;
+  let groupIndex = 0;          // 0-based index of group in whole list
+  let groupIndices = [];       // indices (into pairs) belonging to current group
+  let roundIndices = [];       // indices (into pairs) for current round within group
+  let idx = 0;                 // pointer in roundIndices
+  let wrongSet = new Set();    // wrong in current round
+  let checkedThisCard = false; // avoid double-marking
+  let totalGroups = 0;
 
   function normalize(s) {
-    return (s ?? "")
-      .toString()
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, " ");
+    return (s ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
   }
 
   function parseLines(text) {
     const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
     const out = [];
-
     for (const lineRaw of lines) {
       const line = lineRaw.replace(/\uFEFF/g, "").trim(); // remove BOM if present
       let parts;
@@ -133,9 +142,11 @@
       if (line.includes("\t")) parts = line.split("\t");
       else if (line.includes(";")) parts = line.split(";");
       else if (line.includes(",")) parts = line.split(",");
-      else if (line.includes(" - ")) parts = line.split(" - ");
+      else if (line.includes(" → ")) parts = line.split(" → ");
+      else if (line.includes("→")) parts = line.split("→");
       else if (line.includes(" = ")) parts = line.split(" = ");
       else if (line.includes("=")) parts = line.split("=");
+      else if (line.includes(" - ")) parts = line.split(" - ");
       else if (line.includes("–")) parts = line.split("–");
       else if (line.includes("—")) parts = line.split("—");
       else if (line.includes("-")) parts = line.split("-");
@@ -143,14 +154,10 @@
 
       if (!parts || parts.length < 2) continue;
 
-      const left = (parts[0] ?? "").trim();
-      const right = (parts.slice(1).join(parts[1]?.includes(",") ? "," : " ").trim());
-      if (!left || !right) continue;
-
-      // assume left=en right=pl
-      out.push({ en: left, pl: right });
+      const en = (parts[0] ?? "").trim();
+      const pl = (parts.slice(1).join(parts.includes(",") ? "," : " ").trim());
+      if (en && pl) out.push({ en, pl });
     }
-
     return out;
   }
 
@@ -169,7 +176,7 @@
 
   function updateStats() {
     els.stats.textContent = pairs.length
-      ? `Wczytane słówka: ${pairs.length}. (Błędne wracają w kolejnych rundach aż je opanujesz.)`
+      ? `Wczytane słówka: ${pairs.length}. Grupy po ${groupSize}.`
       : "Brak wczytanych słówek.";
   }
 
@@ -180,41 +187,24 @@
     }
   }
 
-  function makeOrderFromAll() {
-    order = pairs.map((_, i) => i);
-    if (els.shuffle.value === "yes") shuffleArray(order);
-  }
-
-  function makeOrderFromWrong() {
-    order = Array.from(wrongSet);
-    if (els.shuffle.value === "yes") shuffleArray(order);
-  }
-
   function currentQA() {
-    const p = pairs[order[idx]];
-    const mode = els.mode.value;
-    if (mode === "pl-en") return { prompt: p.pl, expected: p.en };
+    const p = pairs[roundIndices[idx]];
+    if (els.mode.value === "pl-en") return { prompt: p.pl, expected: p.en };
     return { prompt: p.en, expected: p.pl };
   }
 
   function updateHeader() {
-    els.roundInfo.textContent = `Runda: ${round}`;
-    els.progress.textContent = `Pytanie ${idx + 1} / ${order.length} • Do powtórki w tej rundzie: ${wrongSet.size}`;
+    els.groupInfo.textContent = `Grupa ${groupIndex + 1} / ${totalGroups}`;
+    els.progress.textContent = `W tej rundzie: ${idx + 1} / ${roundIndices.length} • Do powtórki w grupie: ${wrongSet.size}`;
   }
 
   function render() {
-    if (!pairs.length) {
-      els.quizCard.style.display = "none";
-      updateStats();
-      return;
-    }
-    if (!order.length) {
-      // nothing to show (shouldn't happen unless list empty)
+    if (!pairs.length || !roundIndices.length) {
       els.quizCard.style.display = "none";
       return;
     }
-
     els.quizCard.style.display = "block";
+
     const { prompt } = currentQA();
     els.prompt.textContent = prompt;
     els.answer.value = "";
@@ -224,18 +214,39 @@
     updateHeader();
   }
 
-  function resetQuiz() {
-    if (!pairs.length) return;
-    round = 1;
-    wrongSet = new Set();
+  function startGroup(gIndex) {
+    groupIndex = gIndex;
+
+    // build indices for this group
+    const start = groupIndex * groupSize;
+    const end = Math.min(start + groupSize, pairs.length);
+    groupIndices = [];
+    for (let i = start; i < end; i++) groupIndices.push(i);
+
+    // first round = whole group
+    roundIndices = groupIndices.slice();
+    if (els.shuffle.value === "yes") shuffleArray(roundIndices);
+
     idx = 0;
-    makeOrderFromAll();
+    wrongSet = new Set();
     render();
+  }
+
+  function resetAll() {
+    if (!pairs.length) return;
+
+    groupSize = Math.max(5, Math.min(100, parseInt(els.groupSize.value || "15", 10) || 15));
+    els.groupSize.value = groupSize;
+
+    totalGroups = Math.ceil(pairs.length / groupSize);
+    updateStats();
+
+    startGroup(0);
   }
 
   function markWrongOnce() {
     if (checkedThisCard) return;
-    wrongSet.add(order[idx]);
+    wrongSet.add(roundIndices[idx]);
     checkedThisCard = true;
     updateHeader();
   }
@@ -247,7 +258,6 @@
   }
 
   function checkAnswer() {
-    if (!pairs.length) return;
     const { expected } = currentQA();
     const user = normalize(els.answer.value);
     const exp = normalize(expected);
@@ -267,72 +277,75 @@
   }
 
   function dontKnow() {
-    if (!pairs.length) return;
     const { expected } = currentQA();
-    els.feedback.innerHTML = `<span class="bad">OK, wróci później.</span> Poprawnie: <b>${expected}</b>`;
+    els.feedback.innerHTML = `<span class="bad">OK, wróci w powtórkach.</span> Poprawnie: <b>${expected}</b>`;
     markWrongOnce();
   }
 
   function showAnswer() {
-    if (!pairs.length) return;
     const { expected } = currentQA();
     els.feedback.innerHTML = `Odpowiedź: <b>${expected}</b>`;
-    // Samo "pokaż" nie liczy jako błąd, ale też nie zalicza jako dobrze.
-    // Jeśli chcesz, żeby samo "Pokaż" też wrzucało do powtórek, odkomentuj linię:
-    // markWrongOnce();
   }
 
-  function finishRoundOrNext() {
-    if (!pairs.length) return;
-
+  function next() {
     idx++;
 
-    if (idx < order.length) {
+    // still within current round
+    if (idx < roundIndices.length) {
       render();
       return;
     }
 
-    // End of this round
-    if (wrongSet.size === 0) {
-      els.feedback.innerHTML = `<b>🎉 Brawo!</b> Wszystko opanowane w tej sesji. Kliknij <b>Start / Reset</b>, żeby zacząć od nowa.`;
-      // keep last card visible
-      idx = order.length - 1;
-      updateHeader();
+    // end of round inside group
+    if (wrongSet.size > 0) {
+      // next round = only wrong ones, repeat until wrongSet becomes empty
+      roundIndices = Array.from(wrongSet);
+      if (els.shuffle.value === "yes") shuffleArray(roundIndices);
+      wrongSet = new Set();
+      idx = 0;
+      els.feedback.innerHTML = `<b>Powtórka w grupie:</b> teraz tylko te, które były błędne.`;
+      setTimeout(render, 250);
       return;
     }
 
-    // Start next round with wrong-only
-    round++;
-    idx = 0;
-    makeOrderFromWrong();
+    // group mastered -> go to next group
+    if (groupIndex + 1 < totalGroups) {
+      const nextGroup = groupIndex + 1;
+      els.feedback.innerHTML = `<b>✅ Grupa opanowana!</b> Przechodzę do grupy ${nextGroup + 1} / ${totalGroups}.`;
+      setTimeout(() => startGroup(nextGroup), 350);
+      return;
+    }
 
-    // reset wrongSet for new round (we will refill it with still-wrong)
-    wrongSet = new Set();
-
-    els.feedback.innerHTML = `<b>Runda ${round}</b>: teraz tylko te słówka, które były błędne.`;
-    // short delay so user sees message, then render next
-    setTimeout(render, 250);
+    // all done
+    els.feedback.innerHTML = `<b>🎉 Brawo!</b> Wszystkie słówka z całej bazy są opanowane. Kliknij <b>Start / Reset</b>, żeby zacząć od nowa.`;
+    idx = roundIndices.length - 1;
+    updateHeader();
   }
 
-  // Events
+  // ===== Events =====
   els.file.addEventListener("change", async (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
 
-    // Force UTF-8 decoding (fix PL characters)
+    // Force UTF-8 decoding for Polish characters
     const buffer = await f.arrayBuffer();
     const decoder = new TextDecoder("utf-8");
     const text = decoder.decode(buffer);
 
     const parsed = parseLines(text);
     if (!parsed.length) {
-      alert("Nie udało się wczytać. Sprawdź format: angielski,polski (jedna para na linię).");
+      alert("Nie udało się wczytać. Sprawdź format: EN,PL (jedna para na linię).");
       return;
     }
+
     pairs = parsed;
     saveToStorage();
+
+    groupSize = Math.max(5, Math.min(100, parseInt(els.groupSize.value || "15", 10) || 15));
+    totalGroups = Math.ceil(pairs.length / groupSize);
     updateStats();
-    resetQuiz();
+
+    startGroup(0);
   });
 
   els.loadSample.addEventListener("click", () => {
@@ -340,11 +353,20 @@
 to improve,poprawiać
 take a break,zrobić przerwę
 certainly,z pewnością
-environment,środowisko`;
+environment,środowisko
+rigidity,sztywność
+bearing surfaces,powierzchnie nośne
+probe,sonda
+clogging,zatykanie
+plunger,tłok
+narrow,wąski
+absorption,pochłanianie
+layout,plan
+consist,składać się
+retractable,chowany`;
     pairs = parseLines(sample);
     saveToStorage();
-    updateStats();
-    resetQuiz();
+    resetAll();
   });
 
   els.clear.addEventListener("click", () => {
@@ -354,22 +376,22 @@ environment,środowisko`;
     els.quizCard.style.display = "none";
   });
 
-  els.start.addEventListener("click", resetQuiz);
+  els.start.addEventListener("click", resetAll);
   els.check.addEventListener("click", checkAnswer);
   els.dontKnow.addEventListener("click", dontKnow);
   els.show.addEventListener("click", showAnswer);
-  els.next.addEventListener("click", finishRoundOrNext);
+  els.next.addEventListener("click", next);
 
   els.answer.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      checkAnswer();
-    }
+    if (e.key === "Enter") checkAnswer();
   });
 
-  // Load persisted list
+  // ===== Init =====
   pairs = loadFromStorage();
+  groupSize = Math.max(5, Math.min(100, parseInt(els.groupSize.value || "15", 10) || 15));
+  totalGroups = pairs.length ? Math.ceil(pairs.length / groupSize) : 0;
   updateStats();
-  if (pairs.length) resetQuiz();
+  if (pairs.length) startGroup(0);
 })();
 </script>
 </body>
