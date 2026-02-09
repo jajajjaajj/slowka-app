@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Słówka EN/PL</title>
+
+  <!-- PWA basics -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 16px; max-width: 720px; }
+    h1 { font-size: 20px; margin: 8px 0 16px; }
+    .card { border: 1px solid #ddd; border-radius: 14px; padding: 14px; margin: 12px 0; }
+    .row { display:flex; gap:10px; flex-wrap: wrap; align-items: center; }
+    button, select, input[type="text"] { font-size: 16px; padding: 10px 12px; border-radius: 12px; border: 1px solid #ccc; }
+    button { cursor:pointer; }
+    .big { font-size: 22px; font-weight: 700; }
+    .muted { color:#666; }
+    .ok { color: #0a7; font-weight: 700; }
+    .bad { color: #c22; font-weight: 700; }
+    .spacer { height: 6px; }
+    .full { width: 100%; }
+    .hint { font-size: 14px; color:#666; margin-top: 6px; }
+    .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f3f3f3; padding:2px 6px; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <h1>📚 Słówka EN/PL (offline w przeglądarce)</h1>
+
+  <div class="card">
+    <div class="row">
+      <input id="file" type="file" accept=".csv,.txt" />
+      <button id="loadSample">Wczytaj przykładową listę</button>
+      <button id="clear">Wyczyść listę</button>
+    </div>
+    <div class="hint">
+      Plik: <span class="kbd">angielski,polski</span> (CSV) albo <span class="kbd">angielski\tpolski</span> (TSV). Jedno słówko na linię.
+    </div>
+    <div class="spacer"></div>
+    <div class="row">
+      <label>Tryb:
+        <select id="mode">
+          <option value="pl-en">PL → EN</option>
+          <option value="en-pl">EN → PL</option>
+        </select>
+      </label>
+      <label>Losowo:
+        <select id="shuffle">
+          <option value="yes">Tak</option>
+          <option value="no">Nie</option>
+        </select>
+      </label>
+      <button id="start">Start / Reset</button>
+    </div>
+    <div class="muted" id="stats">Brak wczytanych słówek.</div>
+  </div>
+
+  <div class="card" id="quizCard" style="display:none;">
+    <div class="muted" id="progress"></div>
+    <div class="spacer"></div>
+    <div class="big" id="prompt"></div>
+    <div class="spacer"></div>
+
+    <input class="full" id="answer" type="text" placeholder="Wpisz tłumaczenie..." autocomplete="off" />
+    <div class="spacer"></div>
+
+    <div class="row">
+      <button id="check">Sprawdź</button>
+      <button id="show">Pokaż odpowiedź</button>
+      <button id="next">Następne</button>
+    </div>
+
+    <div class="spacer"></div>
+    <div id="feedback" class="muted"></div>
+  </div>
+
+<script>
+(() => {
+  const els = {
+    file: document.getElementById('file'),
+    loadSample: document.getElementById('loadSample'),
+    clear: document.getElementById('clear'),
+    mode: document.getElementById('mode'),
+    shuffle: document.getElementById('shuffle'),
+    start: document.getElementById('start'),
+    stats: document.getElementById('stats'),
+    quizCard: document.getElementById('quizCard'),
+    progress: document.getElementById('progress'),
+    prompt: document.getElementById('prompt'),
+    answer: document.getElementById('answer'),
+    check: document.getElementById('check'),
+    show: document.getElementById('show'),
+    next: document.getElementById('next'),
+    feedback: document.getElementById('feedback'),
+  };
+
+  let pairs = [];      // {en, pl}
+  let order = [];      // indices
+  let idx = 0;
+  let correct = 0;
+  let tried = 0;
+
+  const STORAGE_KEY = "slownika_pairs_v1";
+
+  function normalize(s) {
+    return (s ?? "")
+      .toString()
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+  }
+
+  function parseLines(text) {
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const out = [];
+    for (const line of lines) {
+      // allow comma, semicolon, tab, or " - " as separator
+      let parts;
+      if (line.includes("\t")) parts = line.split("\t");
+      else if (line.includes(";")) parts = line.split(";");
+      else if (line.includes(",")) parts = line.split(",");
+      else if (line.includes(" - ")) parts = line.split(" - ");
+      else continue;
+
+      const left = (parts[0] ?? "").trim();
+      const right = (parts.slice(1).join(parts.includes(",") ? "," : parts.includes(";") ? ";" : " ").trim()); // keep commas in meaning
+      if (!left || !right) continue;
+
+      // assume left=en right=pl (as you described)
+      out.push({ en: left, pl: right });
+    }
+    return out;
+  }
+
+  function saveToStorage() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(pairs));
+  }
+  function loadFromStorage() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(x => x && x.en && x.pl);
+    } catch { return []; }
+  }
+
+  function updateStats() {
+    els.stats.textContent = pairs.length
+      ? `Wczytane słówka: ${pairs.length}.`
+      : "Brak wczytanych słówek.";
+  }
+
+  function makeOrder() {
+    order = pairs.map((_, i) => i);
+    if (els.shuffle.value === "yes") {
+      for (let i = order.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [order[i], order[j]] = [order[j], order[i]];
+      }
+    }
+  }
+
+  function currentQA() {
+    const p = pairs[order[idx]];
+    const mode = els.mode.value;
+    if (mode === "pl-en") return { prompt: p.pl, expected: p.en, other: p.pl };
+    return { prompt: p.en, expected: p.pl, other: p.en };
+  }
+
+  function render() {
+    if (!pairs.length) {
+      els.quizCard.style.display = "none";
+      updateStats();
+      return;
+    }
+    els.quizCard.style.display = "block";
+    const { prompt } = currentQA();
+    els.prompt.textContent = prompt;
+    els.answer.value = "";
+    els.answer.focus();
+    els.feedback.textContent = "";
+    els.progress.textContent = `Pytanie ${idx + 1} / ${order.length} • Wynik: ${correct}/${tried}`;
+  }
+
+  function resetQuiz() {
+    if (!pairs.length) return;
+    idx = 0; correct = 0; tried = 0;
+    makeOrder();
+    render();
+  }
+
+  function checkAnswer(showAnswer=false) {
+    if (!pairs.length) return;
+    const { expected } = currentQA();
+    const user = normalize(els.answer.value);
+    const exp = normalize(expected);
+
+    if (!showAnswer) tried++;
+
+    if (showAnswer) {
+      els.feedback.innerHTML = `Odpowiedź: <b>${expected}</b>`;
+      return;
+    }
+
+    if (!user) {
+      els.feedback.innerHTML = `<span class="bad">Wpisz odpowiedź 🙂</span>`;
+      tried--; // don't count empty
+      return;
+    }
+
+    if (user === exp) {
+      correct++;
+      els.feedback.innerHTML = `<span class="ok">Dobrze!</span> ✅`;
+    } else {
+      els.feedback.innerHTML = `<span class="bad">Źle.</span> Poprawnie: <b>${expected}</b>`;
+    }
+    els.progress.textContent = `Pytanie ${idx + 1} / ${order.length} • Wynik: ${correct}/${tried}`;
+  }
+
+  function next() {
+    if (!pairs.length) return;
+    idx++;
+    if (idx >= order.length) {
+      els.feedback.innerHTML = `<b>Koniec!</b> Wynik: ${correct}/${tried}. Kliknij <b>Start / Reset</b>, żeby zacząć od nowa.`;
+      idx = order.length - 1;
+      return;
+    }
+    render();
+  }
+
+  // Events
+  els.file.addEventListener("change", async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const text = await f.text();
+    const parsed = parseLines(text);
+    if (!parsed.length) {
+      alert("Nie udało się wczytać. Sprawdź format: angielski,polski (jedna para na linię).");
+      return;
+    }
+    pairs = parsed;
+    saveToStorage();
+    updateStats();
+    resetQuiz();
+  });
+
+  els.loadSample.addEventListener("click", () => {
+    const sample = `apple,jabłko
+to improve,poprawiać
+take a break,zrobić przerwę
+certainly,z pewnością
+environment,środowisko`;
+    pairs = parseLines(sample);
+    saveToStorage();
+    updateStats();
+    resetQuiz();
+  });
+
+  els.clear.addEventListener("click", () => {
+    pairs = [];
+    localStorage.removeItem(STORAGE_KEY);
+    updateStats();
+    els.quizCard.style.display = "none";
+  });
+
+  els.start.addEventListener("click", resetQuiz);
+  els.check.addEventListener("click", () => checkAnswer(false));
+  els.show.addEventListener("click", () => checkAnswer(true));
+  els.next.addEventListener("click", next);
+
+  els.answer.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") checkAnswer(false);
+  });
+
+  // Load persisted list
+  pairs = loadFromStorage();
+  updateStats();
+  if (pairs.length) resetQuiz();
+})();
+</script>
+</body>
+</html>
